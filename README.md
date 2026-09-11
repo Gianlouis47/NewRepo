@@ -1,91 +1,173 @@
 # StrikeoutLab
 
-App móvil personal + backend en la nube para análisis de props de ponches
-(strikeouts) de lanzadores MLB, usada en apuestas en banca física
-dominicana (Star Sport, Lajara Sport).
+Sistema determinista de análisis de props de ponches (strikeouts) de
+lanzadores MLB, para apuestas en banca física dominicana (Star Sport,
+Lajara Sport). **Sin app.** Es Supabase + este repo, usado en vivo desde
+una sesión de Claude Code: se pregunta en el chat ("Skubal 6.5 contra ARI,
+¿conviene?") y se llama directo a la calculadora en Postgres.
 
-**El sistema calcula, no adivina.** No predice ponches ni genera
-confianzas por sí solo — reporta lo que pasó en salidas anteriores, y
+Hubo dos apps (una nativa con Expo, una web con Vite) y las dos se
+abandonaron — cada capa de UI agregaba bugs propios (teclado, estado que se
+borraba al cambiar de pestaña, despliegues) sin sumar nada a lo que ya hacía
+la base de datos sola. La lógica de las dos sigue en el historial de git si
+hace falta retomarla; no se necesita para usar el sistema.
+
+**El sistema calcula, no adivina.** No predice ponches por intuición —
+proyecta con Poisson + log5 + regresión a la media sobre datos reales, y
 audita si las confianzas asignadas (por vos o por la IA) se sostienen
-contra los resultados reales. Si después de 50-100 picks la calibración
-muestra que las confianzas no se sostienen, ese es un resultado válido del
-sistema, no un fallo del código.
-
-El problema que resuelve: este análisis se ha hecho a mano/mentalmente y
-ha producido errores aritméticos repetidos y verificados — confianzas
-asignadas a ojo (82-84%) cuando el conteo real de salidas daba 60%;
-comparar totales de ponches entre equipos en vez de tasas; no calcular la
-probabilidad combinada real de un parlay antes de apostar. StrikeoutLab
-elimina esos tres errores por construcción.
+contra los resultados reales. Si la calibración muestra que no se
+sostienen, ese es un resultado válido del sistema, no un fallo del código.
 
 ## Arquitectura
 
 ```
-packages/core/       # Lógica pura (TypeScript): tasas, reglas de empate,
-                      # calibración, parlay. Sin IO. 117 tests (vitest).
+packages/core/       # Lógica pura (TypeScript), espejo de las funciones de
+                      # Postgres para poder testear sin base de datos: tasas,
+                      # reglas de empate, calibración, parlay, proyección.
+                      # 117 tests (vitest). Si tocás una función acá, tocá
+                      # su equivalente en supabase/migrations — las dos
+                      # tienen que dar el mismo número.
 supabase/
-  migrations/         # Registro de los cambios de esquema (la base manda)
+  migrations/         # Registro de los cambios de esquema. La BASE es la
+                      # fuente de verdad; estos archivos documentan qué se
+                      # aplicó y por qué, no se re-ejecutan para levantar
+                      # el proyecto.
   functions/
-    chat/             # Edge Function principal: la IA lee fotos y texto,
-                      # llama a la calculadora de Postgres y responde
-    analizar-pitcher/ # Edge Function: tasa CALCULADA real + opinión JUICIO
-                      # de la IA, informada por tu historial de calibración
-    analizar-foto/    # Edge Function: lee un ticket/captura con visión IA
-apps/mobile/          # App Expo (React Native + TypeScript), solo para vos
+    chat/             # Edge Function principal: la IA (NVIDIA NIM) lee
+                      # fotos y texto, llama a la calculadora de Postgres
+                      # y responde. Es lo que se llamaría desde un cliente
+                      # si alguna vez vuelve a haber uno.
+    analizar-pitcher/ # Tasa CALCULADA real + opinión JUICIO de la IA,
+                      # informada por el historial de calibración.
+    analizar-foto/    # Lee un ticket/captura con visión IA.
 docs/framework/       # Criterio cualitativo (sharp/sindicato) que sigue la
-                      # IA — el "manual" detrás de fuente_confianza=JUICIO
+                      # IA — el "manual" detrás de fuente_confianza=JUICIO.
 ```
 
-**Por qué Supabase y no Neon:** se evaluó Neon, pero el entorno donde se
-construyó este proyecto tenía bloqueado por política de red todo el
-dominio `neon.tech`. Supabase sí es alcanzable y ya estaba conectado a la
-cuenta, así que es el backend real (Postgres administrado, con Auth,
-Storage y Edge Functions incluidos).
+**Por qué Supabase:** Postgres administrado con Auth, Storage y Edge
+Functions incluidos, alcanzable desde donde se construyó esto (Neon estaba
+bloqueado por política de red del entorno de desarrollo).
 
 **Proyecto Supabase:** `strikeoutlab` (`xuebtkafypivqygyqgcv`, región
-`us-east-1`), plan gratuito.
+`us-east-1`).
+
+## Cómo se usa
+
+No hay pantalla que abrir. Dos caminos:
+
+1. **Desde una sesión de Claude Code con el MCP de Supabase conectado**:
+   pedís el análisis en lenguaje natural y la sesión llama a las funciones
+   de abajo directo contra la base, o reproduce el mismo cálculo con
+   `packages/core` si hace falta explicarlo paso a paso.
+2. **Desde el editor SQL de Supabase**, llamando las funciones a mano:
+
+```sql
+select proyectar_ponches('Skubal', 6.5, 'ARI', null, 'TEMPORADA', -130, 'PROYECCION');
+select historial_lanzador('Skubal', 6.5, 'TEMPORADA', null);
+select evaluar_parlay(array[0.62, 0.59, 0.57], -130, 100, null, 5, 'PROYECCION');
+select calibracion_real('PROYECCION');
+```
+
+El chat de IA (`supabase/functions/chat`) sigue desplegado como Edge
+Function y se le puede pegar directo con `curl` o `supabase functions
+invoke` si se quiere probar el flujo de foto + IA sin escribir SQL a mano.
+
+## Quién puede entrar
+
+RLS está activo en las siete tablas de datos, con una **lista blanca**
+(`usuarios_permitidos`) — estar autenticado en Supabase Auth no alcanza,
+hay que estar en esa tabla. Se agrega gente desde el editor SQL:
+
+```sql
+insert into usuarios_permitidos (user_id, nota)
+select id, 'para qué' from auth.users where email = 'correo@ejemplo.com';
+```
+
+Esto quedó así porque la app web estuvo brevemente pública en una URL de
+Vercel; con "Supabase + repo solamente" ya no hace falta una URL pública,
+pero la lista blanca se queda — es la protección real, no la publishable
+key (que está diseñada para ser pública).
 
 ## Modelo de datos (Postgres)
-
-Mismas tablas que el diseño original en CSV, ahora con las reglas de
-negocio críticas aplicadas *en la base de datos*, no solo en el código:
 
 - **`picks`** — un registro por pick. `resultado` (`GANO`/`PERDIO`/`EMPATE`)
   se deriva automáticamente por un trigger a partir de `resultado_k`,
   `linea` y `pick` — **nunca se puede escribir a mano, ni por error**. Un
   empate en línea entera nunca colapsa en `GANO` ni `PERDIO`.
+  - **Ojo con calibrar sobre picks viejos:** varios `resultado_k` cargados
+    antes de tener el historial real llegaron mal (ver
+    `20260911000000_corrige_resultado_k_contaminado_en_picks.sql` — 6 de 14
+    picks del 25 de agosto tenían el resultado equivocado, verificado
+    contra `game_logs`). Antes de confiar en una calibración con pocos
+    picks, vale la pena cruzarla contra `game_logs` igual que se hizo ahí.
 - **`game_logs`** — historial real de salidas de cada lanzador (`ip` en
-  notación de béisbol: 5.1 = 5 entradas y 1 out).
+  notación de béisbol: 5.1 = 5 entradas y 1 out), cargado de la API oficial
+  de la MLB. 3.658 salidas de 224 abridores, temporada 2026 completa.
 - **`team_k`** — ponches/PA por equipo y ventana (`TEMPORADA` /
   `ULTIMOS_14`), para comparar por tasa y no por total.
-- **`learning_log`** — la bitácora de aprendizaje del framework (antes un
-  archivo markdown), ahora una tabla viva.
-- **`analisis_fotos`** — lo que la IA de visión extrae de cada foto
-  analizada (reservado para cuando se conecte Storage; hoy la Edge
-  Function solo devuelve el JSON extraído, no lo persiste todavía).
+- **`equipo_stats_split`** — K% del equipo rival por mano del lanzador
+  (`RHP`/`LHP`) y ventana — el dato que más mueve una proyección después
+  del propio lanzador.
+- **`equipos_mlb`** / **`equipos_alias`** — traduce abreviaturas de la MLB
+  (`AZ`, `CWS`) a las canónicas del esquema (`ARI`, `CHW`). Sin esto,
+  cualquier juego de esos dos equipos no encontraba al rival.
+- **`pitcher_stats_snapshot`** — K%, WHIP, IP por salida, whiff%/SwStr%,
+  regresados a la media según el tamaño de muestra.
+- **`learning_log`** — bitácora de aprendizaje del framework cualitativo.
+- **`analisis_fotos`** — lo que la IA de visión extrae de cada foto.
+- **`usuarios_permitidos`** — la lista blanca de arriba.
 
-RLS está activo en las cinco tablas: solo una sesión autenticada de
-Supabase Auth puede leer o escribir. El `publishable key` va empacado en
-la app (es público por diseño); la protección real es esa.
+## La calculadora: `proyectar_ponches`
 
-## La IA y el "aprendizaje"
+Método estándar de sabermetría, no inventado:
 
-`analizar-pitcher` no reentrena ningún modelo. En cada llamada:
+1. **log5** combina la tasa de ponche del lanzador con la del rival,
+   relativas al promedio de liga.
+2. **Bateadores enfrentados** de la duración esperada de la salida:
+   `BF ≈ IP × (3 + WHIP)`.
+3. **Poisson** pasa de "K esperados" a probabilidad de superar la línea.
+4. **Regresión a la media (Bayes empírico)** empuja cada stat hacia un
+   ancla en proporción al tamaño de muestra — un relevista con 2 bateadores
+   enfrentados y 1 K no tiene 50% de K%, tiene ruido.
 
-1. Calcula la tasa real (`CALCULADA`) sobre el historial en `game_logs`.
-2. Lee tu historial real de calibración (`reporteCalibracion` sobre tus
-   picks `JUICIO` ya resueltos) y se lo pasa a la IA como contexto: *"en
-   la banda 80-84% has acertado 55% de las veces"*.
-3. Le pide a NVIDIA NIM (modelo configurable, ver abajo) un veredicto
-   `JUICIO`, obligado a ajustar su confianza según ese historial real.
+La implementación en Postgres (fuente de verdad) y la copia en TypeScript
+(`packages/core/src/proyeccion.ts`, para testear sin base de datos) tienen
+que dar el mismo número — si se toca una, se toca la otra.
 
-Eso es el "aprendizaje": evidencia real inyectada en el contexto de cada
-llamada, no un modelo que cambia sus pesos. La API key de NVIDIA vive
-únicamente como secret de Supabase (Edge Function) — nunca en la app.
+**Backtest walk-forward** (8.336 predicciones, solo con datos anteriores a
+cada fecha): en la zona de decisión (52-66% declarado, 2.965 apuestas) el
+modelo declaró 58.78% y la realidad fue 58.72% — sobreconfianza de +0.06
+puntos. El motor de probabilidad está calibrado; eso no dice que el modelo
+completo en vivo (que además usa K% del rival y split por mano) tenga
+ventaja contra las líneas reales de Star Sport — son cosas distintas.
 
-## Configuración
+## La IA y NVIDIA NIM
 
-### 1. Instalar dependencias y correr los tests de `packages/core`
+Las tres Edge Functions llaman a NVIDIA NIM (`integrate.api.nvidia.com`),
+no a un modelo propio ni a otro proveedor:
+
+- `chat`: cascada de modelos de razonamiento (`NVIDIA_MODELOS_TEXTO`,
+  lista separada por comas, default
+  `nvidia/nemotron-3-super-120b-a12b,minimaxai/minimax-m3,deepseek-ai/deepseek-v4-pro-0813`)
+  y de visión (`NVIDIA_MODELOS_VISION`).
+- `analizar-pitcher` / `analizar-foto`: un modelo fijo cada uno
+  (`NVIDIA_MODEL_TEXTO` / `NVIDIA_MODEL_VISION`).
+
+La IA **no inventa números**: calcula la calculadora en Postgres, la IA
+busca, interpreta y da juicio cualitativo (`fuente_confianza = JUICIO`,
+siempre distinguible de `CALCULADA`). En cada llamada se le pasa el
+historial real de calibración como contexto — eso es el "aprendizaje": no
+hay reentrenamiento de pesos.
+
+`NVIDIA_API_KEY` vive únicamente como secret de las Edge Functions —
+nunca en el repo. Configurala desde el dashboard de Supabase (Edge
+Functions → Secrets) o con la CLI:
+
+```bash
+supabase secrets set NVIDIA_API_KEY=tu_key --project-ref xuebtkafypivqygyqgcv
+```
+
+## Instalar y correr los tests de `packages/core`
 
 ```bash
 npm install
@@ -93,103 +175,7 @@ npm test    # 117 tests, lógica pura de cálculo y calibración
 npm run build --workspace packages/core
 ```
 
-### 2. Secret de NVIDIA (obligatorio para que la IA responda)
-
-Necesitás una API key de [build.nvidia.com](https://build.nvidia.com) (ya
-tenés acceso a sus 80+ modelos gratis). Configurala como secret de las
-Edge Functions — **nunca la pegues en el código ni en la app**:
-
-- Dashboard de Supabase → tu proyecto → Edge Functions → Secrets → agregar
-  `NVIDIA_API_KEY`.
-- O con la CLI de Supabase (desde tu computadora):
-  `supabase secrets set NVIDIA_API_KEY=tu_key --project-ref xuebtkafypivqygyqgcv`
-
-Opcional: `NVIDIA_MODEL_TEXTO` (default `meta/llama-3.3-70b-instruct`) y
-`NVIDIA_MODEL_VISION` (default `meta/llama-3.2-90b-vision-instruct`) si
-querés usar otros modelos del catálogo de NVIDIA.
-
-### 3. Crear tu cuenta (la app es de un solo usuario)
-
-Abrí la app y usá "No tengo cuenta todavía" para crear tu usuario con
-email/contraseña (Supabase Auth). Si tu proyecto pide confirmación por
-correo, revisá tu email antes de entrar.
-
-### 4. Correr la app móvil
-
-```bash
-cd apps/mobile
-cp .env.example .env   # ya viene con la URL/publishable key del proyecto
-npm install
-npx expo start
-```
-
-Escaneá el QR con la app **Expo Go** (Android/iOS) desde tu teléfono.
-Nota: `expo-image-picker` se instaló con `npm install` en vez de
-`npx expo install` porque el entorno donde se construyó esto tenía
-bloqueado `api.expo.dev`; si Expo Go se queja de una versión
-incompatible, corré `npx expo install expo-image-picker` vos mismo desde
-tu computadora (sin esa restricción) para que ajuste la versión exacta.
-
-### 3. Generar el APK instalable
-
-Para tener la app en el teléfono sin depender de que el servidor de
-desarrollo esté corriendo, `eas.json` ya trae el perfil `apk` con las
-variables de Supabase adentro, así que no hay nada que configurar:
-
-```bash
-cd apps/mobile
-npm run apk
-```
-
-Si el build sale raro después de cambiar dependencias, `npm run apk:limpio`
-hace lo mismo con `--clear-cache` (tarda bastante más, usalo solo si hace
-falta).
-
-**Ojo con el nombre del paquete.** El binario se llama `eas` pero vive en
-el paquete `eas-cli`, así que `npx eas build` falla con
-`could not determine executable to run`. Los scripts de arriba usan
-`eas-cli`, que es el nombre correcto. Si preferís el comando suelto,
-instalalo global una vez y te ahorrás la espera de `npx` en cada build:
-
-```bash
-npm install -g eas-cli
-eas build --platform android --profile apk
-```
-
-La primera vez pide login de Expo (`eas login`) y ofrece crear las
-credenciales de firma de Android — aceptá, es automático. El build corre
-en los servidores de Expo (10-20 minutos) y termina dando un link para
-bajar el APK al teléfono.
-
-## Pantallas de la app
-
-La idea es que casi todo pase en **Análisis**: vos entregás la información
-y la IA hace el resto. Las demás quedan detrás del botón **Más**, para
-cuando querés meter mano a algo puntual.
-
-Principales:
-
-- **Análisis** (el chat) — mandás una foto o escribís, y la IA lee, busca
-  los datos, llama a la calculadora, evalúa contra la cuota y te devuelve
-  el pick armado con un botón para guardarlo. Cierra siempre con una
-  sugerencia o una pregunta.
-- **Historial** — picks recientes; tocá uno pendiente para registrar los
-  K reales — el `resultado` lo deriva la base de datos, no se escribe a
-  mano. Cada resultado que cargás mejora la calibración.
-- **Calibración** — confianza declarada vs. tasa real de acierto, por
-  banda, y resumen económico.
-
-Detrás de **Más**:
-
-- **Pick manual** — el formulario, para cargar algo a mano. Muestra la
-  proyección y el veredicto CONVIENE / FLOJO / NO CONVIENE.
-- **Parlay** — la escalera de 1 a 12 patas: probabilidad, valor esperado,
-  con cuánto terminás y riesgo de fundirte, con la fila óptima resaltada.
-- **Rivales** — ranking de equipos por tasa de ponches, nunca por total.
-- **Foto** y **Salida** — atajos viejos que sobreviven por comodidad; lo
-  normal es hacerlos desde Análisis.
-
-## Reglas de negocio (sin cambios respecto al diseño original)
+## Reglas de negocio
 
 - Un resultado igual a una línea entera es `EMPATE`, un estado propio,
   nunca colapsado en `GANO` ni `PERDIO` — aplicado por trigger en Postgres.
@@ -197,21 +183,24 @@ Detrás de **Más**:
   insuficiente. Con menos de 20 picks en una banda de confianza,
   `reporteCalibracion` marca `muestraInsuficiente: true`.
 - Nunca se estima ni se rellena un dato faltante — un hueco explícito es
-  preferible a un número inventado (incluyendo el resumen económico:
-  avisa en vez de mostrar un "0.00" falso cuando no hay stake/payout
-  registrado).
+  preferible a un número inventado (ver el caso de Ian Seymour en la
+  migración de corrección de `picks`).
 - `probabilidadParlay` asume independencia entre patas (documentado en su
   código); `detectarCorrelacionMismoJuego` marca cuándo dos patas vienen
   del mismo enfrentamiento.
+- Al -130 el equilibrio es 56.52% (`1/(1+100/130)`) — el número contra el
+  que se compara todo, no el 50%.
 
 ## Qué NO hace este sistema
 
-- No predice ponches — reporta lo que pasó, y audita si las confianzas
-  (tuyas o de la IA) se sostienen.
+- No predice ponches — proyecta con un modelo explícito y audita si las
+  confianzas (propias o de la IA) se sostienen.
 - No genera confianzas "de la nada" sin poder auditarlas después —
   `fuente_confianza` (`CALCULADA` vs `JUICIO`) siempre queda registrado.
 - No garantiza ganancias. Las casas cobran comisión en cada línea, y esa
   ventaja se multiplica en parlays.
+- No tiene interfaz. Si hace falta una para otra persona, es una decisión
+  nueva, no una que este repo ya tomó.
 
 ## `docs/framework/`
 
@@ -221,11 +210,3 @@ un veredicto y una confianza `JUICIO`. `00_marco_transversal.md` es el
 marco compartido; cada archivo numerado agrega su enfoque (props de
 pitcher, matchup de lineup, Statcast, mercado/EV, sharp action, códigos y
 reglas de Star Sport, bankroll físico, etc.).
-
-## Nota sobre el nombre del repositorio
-
-Este proyecto está pensado para vivir en un repositorio llamado
-**StrikeoutLab**. Repositorio actual: `gianlouis47/newrepo` — GitHub
-permite renombrarlo sin romper enlaces existentes desde **Settings →
-General → Repository name**; esa acción no está automatizada aquí porque
-afecta al repositorio en sí, no solo a su contenido.
