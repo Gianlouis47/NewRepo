@@ -133,6 +133,9 @@ gratis y no piden key) los refresca desde la fuente real:
 # Los 30 equipos, ventana TEMPORADA:
 curl "https://xuebtkafypivqygyqgcv.supabase.co/functions/v1/sincronizar-stats?modo=equipos"
 
+# K% del equipo rival por mano del lanzador (RHP/LHP), los 30 equipos:
+curl "https://xuebtkafypivqygyqgcv.supabase.co/functions/v1/sincronizar-stats?modo=splits"
+
 # Todos los lanzadores con al menos 1 aparición (no solo los "Qualified"),
 # dos fetches en total, no uno por jugador:
 curl "https://xuebtkafypivqygyqgcv.supabase.co/functions/v1/sincronizar-stats?modo=pitchers"
@@ -143,15 +146,20 @@ curl "https://xuebtkafypivqygyqgcv.supabase.co/functions/v1/sincronizar-stats?mo
 # repetir subiendo offset (la respuesta trae "siguiente_offset") hasta que sea null
 ```
 
+`modo=splits` necesitó `stats=statSplits&sitCodes=vr`/`vl` — con
+`stats=season&sitCodes=` (lo que se probó primero) el parámetro se ignora y
+devuelve el total de temporada igual con o sin split, un hallazgo que quedó
+comentado en el código para no repetirlo.
+
 **Lo que esto NO puede traer gratis** (probado, no supuesto): `csw_pct`,
 `swstr_pct` y `chase_pct` de `pitcher_stats_snapshot` — el leaderboard
 personalizado de Baseball Savant acepta esos nombres de columna pero los
 devuelve vacíos para todos los lanzadores, solo `whiff_percent` viene con
-datos reales. Los splits por mano (`vs_mano`) de `equipo_stats_split` tampoco:
-el parámetro `sitCodes=vr`/`vl` del team-stats de MLB Stats API se probó y no
-aplica el filtro, devuelve el total de temporada igual con o sin split. Las
-filas existentes de esas columnas quedan como estaban — nunca se inventa un
-número para tapar el hueco.
+datos reales. `swing_pct` y `chase_pct` de `equipo_stats_split` tampoco: son
+métricas de Statcast, no de MLB Stats API, y Baseball Savant no tiene un
+leaderboard a nivel de equipo con split por mano. Las filas existentes de
+esas columnas quedan como estaban — nunca se inventa un número para tapar
+el hueco.
 
 ## La calculadora: `proyectar_ponches`
 
