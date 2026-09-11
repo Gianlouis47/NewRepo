@@ -40,6 +40,9 @@ supabase/
     analizar-pitcher/ # Tasa CALCULADA real + opinión JUICIO de la IA,
                       # informada por el historial de calibración.
     analizar-foto/    # Lee un ticket/captura con visión IA.
+    sincronizar-stats/ # Refresca team_k, pitcher_stats_snapshot y game_logs
+                      # desde MLB Stats API + Baseball Savant (gratis, sin
+                      # key). Ver "Mantener los datos al día" más abajo.
 docs/framework/       # Criterio cualitativo (sharp/sindicato) que sigue la
                       # IA — el "manual" detrás de fuente_confianza=JUICIO.
 ```
@@ -102,7 +105,8 @@ key (que está diseñada para ser pública).
     picks, vale la pena cruzarla contra `game_logs` igual que se hizo ahí.
 - **`game_logs`** — historial real de salidas de cada lanzador (`ip` en
   notación de béisbol: 5.1 = 5 entradas y 1 out), cargado de la API oficial
-  de la MLB. 3.658 salidas de 224 abridores, temporada 2026 completa.
+  de la MLB. Se mantiene al día con `sincronizar-stats` (ver más abajo); la
+  cantidad de salidas y la fecha más reciente cambian cada vez que se corre.
 - **`team_k`** — ponches/PA por equipo y ventana (`TEMPORADA` /
   `ULTIMOS_14`), para comparar por tasa y no por total.
 - **`equipo_stats_split`** — K% del equipo rival por mano del lanzador
@@ -116,6 +120,38 @@ key (que está diseñada para ser pública).
 - **`learning_log`** — bitácora de aprendizaje del framework cualitativo.
 - **`analisis_fotos`** — lo que la IA de visión extrae de cada foto.
 - **`usuarios_permitidos`** — la lista blanca de arriba.
+
+## Mantener los datos al día: `sincronizar-stats`
+
+`game_logs`, `team_k` y `pitcher_stats_snapshot` se quedan viejos solos —
+cada salida que se juega y no se carga es una proyección calculada con menos
+información de la que existe. `sincronizar-stats` (Edge Function,
+`verify_jwt=false`, sin costo porque MLB Stats API y Baseball Savant son
+gratis y no piden key) los refresca desde la fuente real:
+
+```bash
+# Los 30 equipos, ventana TEMPORADA:
+curl "https://xuebtkafypivqygyqgcv.supabase.co/functions/v1/sincronizar-stats?modo=equipos"
+
+# Todos los lanzadores con al menos 1 aparición (no solo los "Qualified"),
+# dos fetches en total, no uno por jugador:
+curl "https://xuebtkafypivqygyqgcv.supabase.co/functions/v1/sincronizar-stats?modo=pitchers"
+
+# Salidas nuevas (por game_pk, no duplica) de los abridores ya identificados,
+# en tandas porque 230+ fetches individuales no entran en una sola invocación:
+curl "https://xuebtkafypivqygyqgcv.supabase.co/functions/v1/sincronizar-stats?modo=salidas&offset=0&limite=60"
+# repetir subiendo offset (la respuesta trae "siguiente_offset") hasta que sea null
+```
+
+**Lo que esto NO puede traer gratis** (probado, no supuesto): `csw_pct`,
+`swstr_pct` y `chase_pct` de `pitcher_stats_snapshot` — el leaderboard
+personalizado de Baseball Savant acepta esos nombres de columna pero los
+devuelve vacíos para todos los lanzadores, solo `whiff_percent` viene con
+datos reales. Los splits por mano (`vs_mano`) de `equipo_stats_split` tampoco:
+el parámetro `sitCodes=vr`/`vl` del team-stats de MLB Stats API se probó y no
+aplica el filtro, devuelve el total de temporada igual con o sin split. Las
+filas existentes de esas columnas quedan como estaban — nunca se inventa un
+número para tapar el hueco.
 
 ## La calculadora: `proyectar_ponches`
 
