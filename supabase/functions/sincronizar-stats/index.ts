@@ -3,6 +3,10 @@
 //
 // Uso:
 //   GET ?modo=equipos   -> team_k (TEMPORADA) para los 30 equipos, un fetch por equipo.
+//   GET ?modo=splits    -> equipo_stats_split.k_pct (RHP/LHP) para los 30 equipos, dos
+//                          fetches por equipo (stats=statSplits&sitCodes=vr|vl -- OJO,
+//                          no alcanza con stats=season&sitCodes=, ese combo ignora el
+//                          split y devuelve el total de temporada).
 //   GET ?modo=pitchers  -> pitcher_stats_snapshot para TODOS los lanzadores con al
 //                          menos 1 aparicion en la temporada (playerPool=all evita el
 //                          filtro "Qualified" que deja afuera a la mayoria de un roster).
@@ -18,10 +22,10 @@
 //                       -> compatibilidad con el modo viejo, un lanzador a la vez.
 //
 // Lo que NO se puede traer gratis por esta via (queda pendiente de carga manual):
-// csw_pct, swstr_pct y chase_pct de pitcher_stats_snapshot (el leaderboard de Savant
-// los devuelve vacios para estas columnas, se probo); k_pct/swing_pct/chase_pct por
-// mano (vs_mano) de equipo_stats_split (el parametro sitCodes=vr/vl del team stats de
-// MLB Stats API se probo y no aplica el split, devuelve el total de temporada igual).
+// csw_pct, swstr_pct y chase_pct de pitcher_stats_snapshot -- el leaderboard de Savant
+// acepta esos nombres de columna pero los devuelve vacios para todos los lanzadores.
+// swing_pct y chase_pct de equipo_stats_split tambien (son metricas de Statcast, no de
+// MLB Stats API, y Savant no tiene un leaderboard team-level con split de mano).
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -134,6 +138,48 @@ async function sincronizarEquipos(supabase: ReturnType<typeof createClient>) {
     }
   }
   return resultados;
+}
+
+// K% del equipo rival por mano del lanzador. La clave es stats=statSplits (NO
+// stats=season) combinado con sitCodes=vr/vl -- se probo primero con stats=season y
+// devolvia el total de temporada igual con o sin sitCodes, sin aplicar ningun split.
+async function sincronizarSplits(supabase: ReturnType<typeof createClient>) {
+  const respEquipos = await fetch(`https://statsapi.mlb.com/api/v1/teams?sportId=1&season=${TEMPORADA}`, { headers: ua });
+  const datosEquipos = await respEquipos.json();
+  const hoy = new Date().toISOString().slice(0, 10);
+  const filas = [];
+  const errores = [];
+  for (const equipo of datosEquipos.teams ?? []) {
+    for (const [sitCode, vsMano] of [["vl", "LHP"], ["vr", "RHP"]] as const) {
+      try {
+        const resp = await fetch(
+          `https://statsapi.mlb.com/api/v1/teams/${equipo.id}/stats?stats=statSplits&group=hitting&season=${TEMPORADA}&sitCodes=${sitCode}`,
+          { headers: ua },
+        );
+        const datos = await resp.json();
+        const stat = datos.stats?.[0]?.splits?.[0]?.stat;
+        if (!stat) {
+          errores.push({ equipo: equipo.abbreviation, vs_mano: vsMano, error: "sin stats" });
+          continue;
+        }
+        const bf = stat.plateAppearances ?? 0;
+        filas.push({
+          equipo: normalizarEquipo(equipo.abbreviation),
+          ventana: "TEMPORADA",
+          vs_mano: vsMano,
+          k_pct: bf > 0 ? Number(((stat.strikeOuts / bf) * 100).toFixed(1)) : null,
+          fecha_corte: hoy,
+          fuente: "MLB Stats API (automatico, stats=statSplits)",
+        });
+      } catch (e) {
+        errores.push({ equipo: equipo.abbreviation, vs_mano: vsMano, error: (e as Error).message });
+      }
+    }
+  }
+  const { error } = await supabase
+    .from("equipo_stats_split")
+    .upsert(filas, { onConflict: "equipo,ventana,vs_mano,fecha_corte" });
+  return { total: filas.length, guardado: !error, error: error?.message, errores };
 }
 
 async function sincronizarPitcher(supabase: ReturnType<typeof createClient>, nombre: string) {
@@ -317,6 +363,11 @@ Deno.serve(async (req: Request) => {
     return new Response(JSON.stringify({ resultados }, null, 2), { headers: { "Content-Type": "application/json" } });
   }
 
+  if (modo === "splits") {
+    const resultado = await sincronizarSplits(supabase);
+    return new Response(JSON.stringify(resultado, null, 2), { headers: { "Content-Type": "application/json" } });
+  }
+
   if (modo === "pitchers") {
     const resultado = await sincronizarTodosLosPitchers(supabase);
     return new Response(JSON.stringify(resultado, null, 2), { headers: { "Content-Type": "application/json" } });
@@ -337,7 +388,7 @@ Deno.serve(async (req: Request) => {
   }
 
   return new Response(
-    JSON.stringify({ error: "usa ?modo=equipos, ?modo=pitchers, ?modo=salidas&offset=0&limite=60, o ?modo=pitcher&nombre=Nombre+Completo" }),
+    JSON.stringify({ error: "usa ?modo=equipos, ?modo=splits, ?modo=pitchers, ?modo=salidas&offset=0&limite=60, o ?modo=pitcher&nombre=Nombre+Completo" }),
     { status: 400, headers: { "Content-Type": "application/json" } },
   );
 });
